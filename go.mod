@@ -1,12 +1,9 @@
-module safestore
+module github.com/garder500/neonschema
 
 go 1.23
 
 require (
 	github.com/gorilla/websocket v1.5.3
-	github.com/jackc/pgx/v5 v5.7.2
-	gorm.io/driver/postgres v1.5.11
-	gorm.io/gorm v1.25.12
 )
 
 require github.com/gorilla/mux v1.8.1
