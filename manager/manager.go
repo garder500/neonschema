@@ -1,367 +1,350 @@
 package manager
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"strings"
-	"time"
-
-	"github.com/vmihailenco/msgpack"
+	"sync"
 )
 
-type fileWriter struct {
-	dataFile *os.File
-	idxFile  *os.File
-}
-
 type Idx struct {
-	start int64
-	end   int64
+	Start int64
+	End   int64
 }
 
 type Manager struct {
-	Index      map[string]Idx
-	Path       string // Path to the directory where data will be stored
-	Channel    chan string
-	status     string
-	fileWriter fileWriter
+	Index    map[string]Idx
+	Path     string
+	Channel  chan string
+	status   string
+	dataFile *os.File
+	idxFile  *os.File
+	mutex    sync.RWMutex
 }
 
+// NewManager initializes a Manager struct
 func NewManager(path string) *Manager {
+	if path == "" {
+		path = "/tmp"
+	}
+
 	return &Manager{
-		Index: make(map[string]Idx),
-		Path: func() string {
-			if path == "" {
-				return "/tmp"
-			}
-			return path
-		}(),
+		Index:   make(map[string]Idx),
+		Path:    path,
 		Channel: make(chan string),
 		status:  "idle",
 	}
 }
 
-func (m *Manager) Start() {
-	fmt.Println("Starting manager...")
-	// create the data directory
-	// first check if the directory exists or not
+// Start initializes files, indexes, and starts the loop
+func (m *Manager) Start() error {
 	if _, err := os.Stat(m.Path); os.IsNotExist(err) {
-		// create the directory
-		err := os.Mkdir(m.Path, 0755)
-		if err != nil {
-			fmt.Println("Error creating directory:", err)
-			return
+		if err := os.MkdirAll(m.Path, 0755); err != nil {
+			return err
 		}
 	}
-	// we need to read the index files and load the data into the index map
-	// list every directory in the data directory
-	files, err := os.ReadDir(m.Path)
+
+	var err error
+
+	// Open/create data file
+	m.dataFile, err = os.OpenFile(m.Path+"/data.bin", os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		fmt.Println("Error reading directory:", err)
-		return
+		return err
 	}
-	for _, file := range files {
 
-		// read the file and load the data into the index
-		f, err := os.OpenFile(fmt.Sprintf("%s/%s", m.Path, file.Name()), os.O_RDWR|os.O_CREATE, 0644)
-		if err != nil {
-			fmt.Println("Error opening file:", err)
-			return
-		}
-		if file.Name() == ".idx" {
-			m.fileWriter.idxFile = f
-			// here we will add each key to the index map
-			// the index file is written as key,start,end
-			// each index file is named .idx
-			for {
-				var key string
-				var start, end int64
-				// we only need the key and the start and end positions and we add those data to the index
-				_, err := fmt.Fscanf(f, "%s,%d,%d\n", &key, &start, &end)
-				// if we encounter an empty line, we continue to the next line. This is to avoid reading deleted index
-				if key == "" {
-					continue
-				}
-				if err != nil {
-					break
-				}
-				m.Index[key] = Idx{
-					start: start,
-					end:   end,
-				}
-			}
-		} else {
-			m.fileWriter.dataFile = f
-		}
-
+	// Open/create index file
+	m.idxFile, err = os.OpenFile(m.Path+"/.idx", os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return err
 	}
+
+	if err = m.loadIndex(); err != nil {
+		return err
+	}
+
 	go m.loop()
+	return nil
 }
 
+func (m *Manager) loadIndex() error {
+	scanner := bufio.NewScanner(m.idxFile)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Split(line, ",")
+		if len(parts) != 3 {
+			continue
+		}
+
+		key := parts[0]
+		var start, end int64
+		_, err := fmt.Sscanf(parts[1]+" "+parts[2], "%d %d", &start, &end)
+		if err != nil {
+			continue
+		}
+
+		m.Index[key] = Idx{Start: start, End: end}
+	}
+
+	return scanner.Err()
+}
+
+func (m *Manager) loop() {
+	m.status = "ready"
+	for msg := range m.Channel {
+		commands := strings.Fields(msg)
+
+		switch commands[0] {
+		case "exit":
+			m.status = "exiting"
+			close(m.Channel)
+			return
+		case "status":
+			fmt.Println("Status:", m.status)
+		case "add":
+			m.handleAdd(commands[1:])
+		case "get":
+			fmt.Println(m.GetData(commands[1]))
+		case "delete":
+			m.DeleteData(commands[1])
+		default:
+			fmt.Println("Available commands: exit, status, add <key> <json>, get <key>, delete <key>")
+		}
+	}
+}
+
+func (m *Manager) handleAdd(args []string) {
+	if len(args)%2 != 0 {
+		fmt.Println("Invalid ADD command format. Use: add <key> <json>")
+		return
+	}
+
+	for i := 0; i < len(args); i += 2 {
+		key, jsonData := args[i], args[i+1]
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonData), &data); err != nil {
+			fmt.Println("JSON parse error:", err)
+			continue
+		}
+		if err := m.AddData(key, jsonData); err != nil {
+			fmt.Println("Error adding data:", err)
+		}
+	}
+}
+
+func (m *Manager) rewriteFiles() error {
+	m.dataFile.Truncate(0)
+	m.dataFile.Seek(0, 0)
+
+	m.idxFile.Truncate(0)
+	m.idxFile.Seek(0, 0)
+
+	writerData := bufio.NewWriter(m.dataFile)
+	writerIdx := bufio.NewWriter(m.idxFile)
+
+	var cursor int64
+
+	for key, idx := range m.Index {
+		data := make([]byte, idx.End-idx.Start)
+		if _, err := m.dataFile.ReadAt(data, idx.Start); err != nil {
+			return err
+		}
+
+		length, err := writerData.Write(data)
+		if err != nil {
+			return err
+		}
+
+		fmt.Fprintf(writerIdx, "%s,%d,%d\n", key, cursor, cursor+int64(length))
+		m.Index[key] = Idx{Start: cursor, End: cursor + int64(len(data))}
+		cursor += int64(len(data))
+
+		// Ensure data is flushed periodically if the file is very large.
+		writerIdx.Flush()
+		writerIdx.Flush()
+	}
+
+	writerIdx.Flush()
+	writerIdx.Flush()
+	return nil
+}
+
+// AddData correctly updating the data and index files
+func (m *Manager) AddData(key, data string) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	// If already exists, delete first to avoid duplicates
+	if _, exists := m.Index[key]; exists {
+		if err := m.deletePhysicalKey(key); err != nil {
+			return err
+		}
+	}
+
+	info, err := m.dataFile.Stat()
+	if err != nil {
+		return err
+	}
+
+	start := info.Size()
+	length, err := m.dataFile.WriteAt([]byte(data), start)
+	if err != nil {
+		return err
+	}
+
+	end := start + int64(length)
+	m.Index[key] = Idx{Start: start, End: end}
+
+	if err := m.rewriteIndex(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// deletePhysicalKey removes the data associated with the key from the data file
+func (m *Manager) deletePhysicalKey(key string) error {
+	idx, exists := m.Index[key]
+	if !exists {
+		return fmt.Errorf("key %s not found", key)
+	}
+
+	// Remove the data from the data file
+	data := make([]byte, idx.End-idx.Start)
+	if _, err := m.dataFile.ReadAt(data, idx.Start); err != nil {
+		return err
+	}
+
+	// Update the index
+	delete(m.Index, key)
+
+	return nil
+}
+
+// rewriteIndex persists current index map to idxFile.
+func (m *Manager) rewriteIndex() error {
+	m.idxFile.Truncate(0)
+	m.idxFile.Seek(0, 0)
+
+	writer := bufio.NewWriter(m.idxFile)
+	for k, v := range m.Index {
+		if _, err := fmt.Fprintf(writer, "%s,%d,%d\n", k, v.Start, v.End); err != nil {
+			return err
+		}
+	}
+	return writer.Flush()
+}
+
+// DeleteData removes the data physically from the file and updates the index properly
+func (m *Manager) DeleteData(key string) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	_, exists := m.Index[key]
+	if !exists {
+		return fmt.Errorf("key %s not found", key)
+	}
+
+	// remove from index map
+	delete(m.Index, key)
+
+	// Rewrite the data file
+	tempFilePath := m.Path + "/temp_data.bin"
+	tempFile, err := os.OpenFile(tempFilePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+
+	var cursor int64
+	writer := bufio.NewWriter(tempFile)
+
+	// recreate index and data file
+	for k, idx := range m.Index {
+		data := make([]byte, idx.End-idx.Start)
+		if _, err := m.dataFile.ReadAt(data, idx.Start); err != nil {
+			tempFile.Close()
+			return err
+		}
+
+		n, err := writer.Write(data)
+		if err != nil {
+			tempFile.Close()
+			return err
+		}
+
+		// update the index directly
+		m.Index[k] = Idx{
+			Start: cursor,
+			End:   cursor + int64(n),
+		}
+		cursor += int64(n)
+	}
+
+	writer.Flush()
+	tempFile.Close()
+	m.dataFile.Close()
+
+	// Replace the original file with the temp updated file
+	if err := os.Rename(tempFilePath, m.Path+"/data.bin"); err != nil {
+		return err
+	}
+
+	// reopen file handles
+	m.dataFile, err = os.OpenFile(m.Path+"/data.bin", os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+
+	// rewrite index file as well
+	if err := m.rewriteIndex(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (m *Manager) rebuildIndexFile() error {
+	m.idxFile.Truncate(0)
+	m.idxFile.Seek(0, 0)
+
+	writer := bufio.NewWriter(m.idxFile)
+	for key, idx := range m.Index {
+		if _, err := fmt.Fprintf(writer, "%s,%d,%d\n", key, idx.Start, idx.End); err != nil {
+			return err
+		}
+	}
+
+	return writer.Flush()
+}
+
+// GetData reads data from the data file using provided key
+func (m *Manager) GetData(key string) (string, error) {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	idx, exists := m.Index[key]
+	if !exists {
+		return "", fmt.Errorf("key %s not found", key)
+	}
+
+	data := make([]byte, idx.End-idx.Start)
+	if _, err := m.dataFile.ReadAt(data, idx.Start); err != nil {
+		return "", err
+	}
+
+	return string(data), nil
+}
+
+// Status returns current status
 func (m *Manager) Status() string {
 	return m.status
 }
-func (m *Manager) loop() {
-	m.status = "ready"
-	for {
-		select {
-		case msg := <-m.Channel:
-			fmt.Println(msg)
-			// let's parse commands here
-			splitted := strings.Split(msg, " ")
-			switch splitted[0] {
-			case "exit":
-				fmt.Println("Exiting manager...")
-				m.status = "exiting"
-				return
-			case "status":
-				fmt.Println("Status:", m.status)
-			case "add":
-				if len(splitted) < 3 {
-					fmt.Println("Invalid command")
-					break
-				}
-				// We can add multiple key-value pairs. (key = id, value = json mapping)
-				for i := 1; i < len(splitted); i++ {
-					if i%2 != 1 {
-						continue
-					}
-					if len(splitted) < i+1 {
-						fmt.Println("Invalid command")
-						break
-					}
-					var data map[string]interface{}
-					err := json.Unmarshal([]byte(splitted[i+1]), &data)
-					if err != nil {
-						fmt.Println("Error parsing JSON:", err)
-						break
-					}
-					m.AddData(splitted[i], data)
-				}
 
-			case "get":
-				if len(splitted) < 2 {
-					fmt.Println("Invalid command")
-					break
-				}
-				fmt.Println(m.GetData(splitted[1]))
-			case "delete":
-				if len(splitted) < 2 {
-					fmt.Println("Invalid command")
-					break
-				}
-				m.DeleteData(splitted[1])
-			default:
-				// return commands list
-				fmt.Println("Commands:")
-				fmt.Println("exit")
-				fmt.Println("status")
-				fmt.Println("add <key> <JSON data> <key> <JSON data> ...")
-				fmt.Println("get <key>")
-				fmt.Println("delete <key>")
-			}
-		default:
-			fmt.Println("status:", m.status)
-			fmt.Println("No messages received")
-		}
-		time.Sleep(1 * time.Second)
-	}
-}
-
+// Stop safely shuts down the Manager
 func (m *Manager) Stop() {
-	fmt.Println("Stopping manager...")
 	m.Channel <- "exit"
-}
-
-func (m *Manager) AddData(key string, data map[string]interface{}) {
-	fmt.Printf("adding data with key %s\n", key)
-	// we will add data to the index. (we will also lauch a goroutine to write the data to disk)
-	m.Index[key] = Idx{
-		start: 0,
-		end:   0,
-	}
-
-	m.writeData(key, data)
-}
-
-func (m *Manager) writeData(key string, data map[string]interface{}) {
-
-	// we first need to check if an idx file exists or not
-	// if it does, we will append the data to the file
-	// if it doesn't, we will create a new file and write the data to it
-	if m.fileWriter.idxFile == nil || m.fileWriter.dataFile == nil {
-		// create a new file
-		idxFile, err := os.OpenFile(fmt.Sprintf("%s/a.idx", m.Path), os.O_RDWR|os.O_CREATE, 0644)
-		if err != nil {
-			fmt.Println("Error opening idx file:", err)
-			return
-		}
-
-		// we will write the data to the file
-		// we will also write the data to the data file
-		dataFile, err := os.OpenFile(m.Path+"/a.bin", os.O_RDWR|os.O_CREATE, 0644)
-		if err != nil {
-			fmt.Println("Error opening data file:", err)
-			return
-		}
-
-		// let's add those file handles to the fileWriter struct
-		m.fileWriter.idxFile = idxFile
-		m.fileWriter.dataFile = dataFile
-	}
-
-	// let's take the first idx and data file
-	idxFile := m.fileWriter.idxFile
-	dataFile := m.fileWriter.dataFile
-	fileStat, err := dataFile.Stat()
-	if err != nil {
-		fmt.Println("Error getting file stats:", err)
-		return
-	}
-	// we will get the start and end positions
-	start := fileStat.Size()
-	dataToWrite, err := msgpack.Marshal(data)
-	if err != nil {
-		fmt.Println("Error marshalling data:", err)
-		return
-	}
-
-	// we will write the data to the file
-	totalByte, err := dataFile.WriteAt(dataToWrite, start)
-	if err != nil {
-		fmt.Println("Error writing to file:", err)
-		return
-	}
-	end := start + int64(totalByte)
-	// we will write the index to the index file
-	_, err = fmt.Fprintf(idxFile, "%s,%d,%d\n", key, start, end)
-	if err != nil {
-		fmt.Println("Error writing to file:", err)
-		return
-	}
-
-	m.Index[key] = Idx{
-		start: start,
-		end:   end,
-	}
-	// let's write the index to the file
-	dataFile.Sync()
-	idxFile.Sync()
-
-}
-
-func (m *Manager) GetData(key string) (string, error) {
-	fmt.Printf("getting data with key %s\n", key)
-
-	if val, ok := m.Index[key]; ok {
-		dataFile := m.fileWriter.dataFile
-
-		// Calculer la taille exacte des données à lire
-		size := val.end - val.start
-		data := make([]byte, size)
-
-		// Utiliser ReadAt pour lire les données
-		_, err := dataFile.ReadAt(data, val.start)
-		if err != nil {
-			if err == io.EOF {
-				// Gérer EOF de manière appropriée
-				return "", fmt.Errorf("unexpected EOF: %v", err)
-			}
-			return "", fmt.Errorf("error reading file: %v", err)
-		}
-
-		// Pas besoin de découper data, car nous avons déjà la taille exacte
-		unpackedData := make(map[string]interface{})
-		err = msgpack.Unmarshal(data, &unpackedData)
-		if err != nil {
-			return "", fmt.Errorf("error unmarshalling data: %v", err)
-		}
-		// Retourner les données sous forme de chaîne JSON
-		jsonData, err := json.Marshal(unpackedData)
-		if err != nil {
-			return "", fmt.Errorf("error marshalling data: %v", err)
-		}
-
-		return string(jsonData), nil
-	}
-
-	return "", fmt.Errorf("key not found")
-}
-
-func (m *Manager) DeleteData(key string) {
-	fmt.Printf("removing data with key %s\n", key)
-	// remove data from index
-	delete(m.Index, key)
-	// delete data from disk
-	m.deleteData(key)
-}
-
-func (m *Manager) deleteData(key string) error {
-	if val, ok := m.Index[key]; ok {
-		// 1. Supprimer l'entrée de l'index en mémoire
-		delete(m.Index, key)
-
-		// 2. Marquer l'espace comme libre dans le fichier de données
-		dataFile := m.fileWriter.dataFile
-		emptyData := make([]byte, val.end-val.start)
-		_, err := dataFile.WriteAt(emptyData, val.start)
-		if err != nil {
-			return fmt.Errorf("error writing empty data: %v", err)
-		}
-
-		// 3. Mettre à jour le fichier d'index
-		return m.rewriteIndexFile(key)
-	}
-	return fmt.Errorf("key not found")
-}
-
-func (m *Manager) rewriteIndexFile(key string) error {
-	idxFile := m.fileWriter.idxFile
-
-	// Créer un nouveau fichier d'index temporaire
-	tmpIdxFile, err := os.Create(fmt.Sprintf("%s/tmp.idx", m.Path))
-	if err != nil {
-		return fmt.Errorf("error creating temporary index file: %v", err)
-	}
-	defer tmpIdxFile.Close()
-
-	// Copier les entrées valides de l'index actuel vers le fichier temporaire
-	for k, v := range m.Index {
-		if k == key {
-			continue
-		}
-		_, err := fmt.Fprintf(tmpIdxFile, "%s,%d,%d\n", k, v.start, v.end)
-		if err != nil {
-			return fmt.Errorf("error writing to temporary index file: %v", err)
-		}
-	}
-
-	// Fermer le fichier d'index actuel
-	err = idxFile.Close()
-	if err != nil {
-		return fmt.Errorf("error closing index file: %v", err)
-	}
-
-	// Supprimer l'ancien fichier d'index
-	err = os.Remove(fmt.Sprintf("%s/a.idx", m.Path))
-	if err != nil {
-		return fmt.Errorf("error removing old index file: %v", err)
-	}
-
-	// Renommer le fichier temporaire en fichier d'index actuel
-	err = os.Rename(fmt.Sprintf("%s/tmp.idx", m.Path), fmt.Sprintf("%s/a.idx", m.Path))
-	if err != nil {
-		return fmt.Errorf("error renaming temporary index file: %v", err)
-	}
-
-	// Ouvrir le nouveau fichier d'index
-	idxFile, err = os.OpenFile(fmt.Sprintf("%s/a.idx", m.Path), os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return fmt.Errorf("error opening new index file: %v", err)
-	}
-
-	// Mettre à jour le fichier d'index dans le fileWriter
-	m.fileWriter.idxFile = idxFile
+	m.dataFile.Close()
+	m.idxFile.Close()
+	m.status = "stopped"
 }

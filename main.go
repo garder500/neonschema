@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -15,22 +16,39 @@ func main() {
 	}
 
 	manager := manager.NewManager(fmt.Sprintf("%s/data", pwd))
-	go manager.Start()
-	for manager.Status() != "ready" {
-		time.Sleep(1 * time.Second)
-		fmt.Println("Waiting for manager to be ready...")
+	if err := manager.Start(); err != nil {
+		fmt.Println("Failed start:", err)
 	}
-	manager.AddData("test", map[string]interface{}{
+
+	manager.DeleteData("salut")
+	dataToAdd := map[string]interface{}{
 		"username": "garder",
-	})
+	}
+	dataToAddJSON, err := json.Marshal(dataToAdd)
+	if err != nil {
+		panic(fmt.Sprintf("Error marshaling data: %s", err))
+	}
+	manager.AddData("test", string(dataToAddJSON))
+	manager.AddData("garder", string(dataToAddJSON))
 	// let's try reading the data
 	data, err := manager.GetData("test")
 	if err != nil {
-		panic(fmt.Sprintf("Error getting data: %s", err))
+		fmt.Println("Error getting data:", err)
+	} else {
+		fmt.Println(data)
 	}
-	fmt.Println(data)
-	manager.DeleteData("test")
+	manager.AddData("salut", string(dataToAddJSON))
+	manager.AddData("salut", string("test"))
 
+	manager.DeleteData("garder")
+	manager.DeleteData("test")
+	// let's try reading the data
+	data, err = manager.GetData("test")
+	if err != nil {
+		fmt.Println("Error getting data:", err)
+	} else {
+		fmt.Println(data)
+	}
 	time.Sleep(1 * time.Second)
 	manager.Stop()
 
