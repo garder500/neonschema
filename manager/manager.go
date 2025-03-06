@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Idx struct {
@@ -15,30 +16,35 @@ type Idx struct {
 }
 
 type Manager struct {
-	Index    map[string]Idx
-	Path     string
-	Channel  chan string
-	status   string
-	dataFile *os.File
-	idxFile  *os.File
-	mutex    sync.RWMutex
+	Index      map[string]Idx
+	Path       string
+	Channel    chan string
+	status     string
+	dataFile   *os.File
+	idxFile    *os.File
+	mutex      sync.RWMutex
+	changeCh   chan struct{} // Notify background job
+	stopCh     chan struct{} // Graceful shutdown
+	syncPeriod time.Duration // configurable rewrite period
 }
 
-// NewManager initializes a Manager struct
+// NewManager initializes a Manager struct with a default 30s interval for rewrite
 func NewManager(path string) *Manager {
 	if path == "" {
 		path = "/tmp"
 	}
 
 	return &Manager{
-		Index:   make(map[string]Idx),
-		Path:    path,
-		Channel: make(chan string),
-		status:  "idle",
+		Index:      make(map[string]Idx),
+		Path:       path,
+		Channel:    make(chan string),
+		status:     "idle",
+		changeCh:   make(chan struct{}, 1),
+		stopCh:     make(chan struct{}),
+		syncPeriod: 5 * time.Second,
 	}
 }
 
-// Start initializes files, indexes, and starts the loop
 func (m *Manager) Start() error {
 	if _, err := os.Stat(m.Path); os.IsNotExist(err) {
 		if err := os.MkdirAll(m.Path, 0755); err != nil {
@@ -47,14 +53,11 @@ func (m *Manager) Start() error {
 	}
 
 	var err error
-
-	// Open/create data file
 	m.dataFile, err = os.OpenFile(m.Path+"/data.bin", os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return err
 	}
 
-	// Open/create index file
 	m.idxFile, err = os.OpenFile(m.Path+"/.idx", os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return err
@@ -65,6 +68,9 @@ func (m *Manager) Start() error {
 	}
 
 	go m.loop()
+	go m.startRewriteWorker()
+
+	m.status = "ready"
 	return nil
 }
 
@@ -77,26 +83,24 @@ func (m *Manager) loadIndex() error {
 			continue
 		}
 
-		key := parts[0]
 		var start, end int64
-		_, err := fmt.Sscanf(parts[1]+" "+parts[2], "%d %d", &start, &end)
-		if err != nil {
+		if _, err := fmt.Sscanf(parts[1]+" "+parts[2], "%d %d", &start, &end); err != nil {
 			continue
 		}
 
-		m.Index[key] = Idx{Start: start, End: end}
+		m.Index[parts[0]] = Idx{Start: start, End: end}
 	}
 
 	return scanner.Err()
 }
 
 func (m *Manager) loop() {
-	m.status = "ready"
 	for msg := range m.Channel {
 		commands := strings.Fields(msg)
 
 		switch commands[0] {
 		case "exit":
+			close(m.stopCh)
 			m.status = "exiting"
 			close(m.Channel)
 			return
@@ -105,77 +109,43 @@ func (m *Manager) loop() {
 		case "add":
 			m.handleAdd(commands[1:])
 		case "get":
-			fmt.Println(m.GetData(commands[1]))
+			if data, err := m.GetData(commands[1]); err != nil {
+				fmt.Println("Error:", err)
+			} else {
+				fmt.Println(data)
+			}
 		case "delete":
-			m.DeleteData(commands[1])
+			if err := m.DeleteData(commands[1]); err != nil {
+				fmt.Println("Error:", err)
+			}
 		default:
-			fmt.Println("Available commands: exit, status, add <key> <json>, get <key>, delete <key>")
+			fmt.Println("Commands: exit, status, add <key> <json>, get <key>, delete <key>")
 		}
 	}
 }
 
 func (m *Manager) handleAdd(args []string) {
 	if len(args)%2 != 0 {
-		fmt.Println("Invalid ADD command format. Use: add <key> <json>")
+		fmt.Println("Invalid ADD command. Use format: add <key> <json>")
 		return
 	}
 
 	for i := 0; i < len(args); i += 2 {
 		key, jsonData := args[i], args[i+1]
-		var data map[string]interface{}
-		if err := json.Unmarshal([]byte(jsonData), &data); err != nil {
-			fmt.Println("JSON parse error:", err)
+		if err := json.Unmarshal([]byte(jsonData), &map[string]interface{}{}); err != nil {
+			fmt.Println("JSON error:", err)
 			continue
 		}
 		if err := m.AddData(key, jsonData); err != nil {
-			fmt.Println("Error adding data:", err)
+			fmt.Println("Add error:", err)
 		}
 	}
 }
 
-func (m *Manager) rewriteFiles() error {
-	m.dataFile.Truncate(0)
-	m.dataFile.Seek(0, 0)
-
-	m.idxFile.Truncate(0)
-	m.idxFile.Seek(0, 0)
-
-	writerData := bufio.NewWriter(m.dataFile)
-	writerIdx := bufio.NewWriter(m.idxFile)
-
-	var cursor int64
-
-	for key, idx := range m.Index {
-		data := make([]byte, idx.End-idx.Start)
-		if _, err := m.dataFile.ReadAt(data, idx.Start); err != nil {
-			return err
-		}
-
-		length, err := writerData.Write(data)
-		if err != nil {
-			return err
-		}
-
-		fmt.Fprintf(writerIdx, "%s,%d,%d\n", key, cursor, cursor+int64(length))
-		m.Index[key] = Idx{Start: cursor, End: cursor + int64(len(data))}
-		cursor += int64(len(data))
-
-		// Ensure data is flushed periodically if the file is very large.
-		writerIdx.Flush()
-		writerIdx.Flush()
-	}
-
-	writerIdx.Flush()
-	writerIdx.Flush()
-	return nil
-}
-
-// AddData correctly updating the data and index files
 func (m *Manager) AddData(key, data string) error {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	// If already exists, delete first to avoid duplicates
 	if _, exists := m.Index[key]; exists {
 		if err := m.deletePhysicalKey(key); err != nil {
 			return err
@@ -187,163 +157,149 @@ func (m *Manager) AddData(key, data string) error {
 		return err
 	}
 
-	start := info.Size()
-	length, err := m.dataFile.WriteAt([]byte(data), start)
+	length, err := m.dataFile.WriteAt([]byte(data), info.Size())
 	if err != nil {
 		return err
 	}
 
-	end := start + int64(length)
-	m.Index[key] = Idx{Start: start, End: end}
+	m.Index[key] = Idx{Start: info.Size(), End: info.Size() + int64(length)}
 
-	if err := m.rewriteIndex(); err != nil {
-		return err
-	}
+	m.scheduleRewrite()
 
 	return nil
 }
 
-// deletePhysicalKey removes the data associated with the key from the data file
-func (m *Manager) deletePhysicalKey(key string) error {
-	idx, exists := m.Index[key]
-	if !exists {
-		return fmt.Errorf("key %s not found", key)
+func (m *Manager) DeleteData(key string) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if _, exists := m.Index[key]; !exists {
+		return fmt.Errorf("Key %s not found", key)
 	}
 
-	// Remove the data from the data file
-	data := make([]byte, idx.End-idx.Start)
-	if _, err := m.dataFile.ReadAt(data, idx.Start); err != nil {
-		return err
-	}
-
-	// Update the index
 	delete(m.Index, key)
 
+	m.scheduleRewrite()
+
 	return nil
 }
 
-// rewriteIndex persists current index map to idxFile.
+func (m *Manager) deletePhysicalKey(key string) error {
+	if _, ok := m.Index[key]; !ok {
+		return nil
+	}
+	delete(m.Index, key)
+	return nil
+}
+
+func (m *Manager) scheduleRewrite() {
+	select {
+	case m.changeCh <- struct{}{}:
+	default:
+	}
+}
+
+func (m *Manager) startRewriteWorker() {
+	timer := time.NewTimer(m.syncPeriod)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-m.changeCh:
+			timer.Reset(m.syncPeriod)
+		case <-timer.C:
+			m.mutex.Lock()
+			if err := m.rewriteFiles(); err != nil {
+				fmt.Println("Rewrite error:", err)
+			}
+			m.mutex.Unlock()
+		case <-m.stopCh:
+			return
+		}
+	}
+}
+
+func (m *Manager) rewriteFiles() error {
+	tmpDataPath := m.Path + "/data.tmp"
+
+	tmpFile, err := os.OpenFile(tmpDataPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+
+	writer := bufio.NewWriter(tmpFile)
+
+	var cursor int64
+	for key, idx := range m.Index {
+		buffer := make([]byte, idx.End-idx.Start)
+		if _, err := m.dataFile.ReadAt(buffer, idx.Start); err != nil {
+			tmpFile.Close()
+			return err
+		}
+
+		n, err := writer.Write(buffer)
+		if err != nil {
+			tmpFile.Close()
+			return err
+		}
+
+		m.Index[key] = Idx{Start: cursor, End: cursor + int64(n)}
+		cursor += int64(n)
+	}
+
+	writer.Flush()
+	tmpFile.Close()
+	m.dataFile.Close()
+
+	if err := os.Rename(tmpDataPath, m.Path+"/data.bin"); err != nil {
+		return err
+	}
+
+	m.dataFile, err = os.OpenFile(m.Path+"/data.bin", os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+
+	return m.rewriteIndex()
+}
+
 func (m *Manager) rewriteIndex() error {
 	m.idxFile.Truncate(0)
 	m.idxFile.Seek(0, 0)
 
 	writer := bufio.NewWriter(m.idxFile)
 	for k, v := range m.Index {
-		if _, err := fmt.Fprintf(writer, "%s,%d,%d\n", k, v.Start, v.End); err != nil {
-			return err
-		}
-	}
-	return writer.Flush()
-}
-
-// DeleteData removes the data physically from the file and updates the index properly
-func (m *Manager) DeleteData(key string) error {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
-	_, exists := m.Index[key]
-	if !exists {
-		return fmt.Errorf("key %s not found", key)
-	}
-
-	// remove from index map
-	delete(m.Index, key)
-
-	// Rewrite the data file
-	tempFilePath := m.Path + "/temp_data.bin"
-	tempFile, err := os.OpenFile(tempFilePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
-	if err != nil {
-		return err
-	}
-
-	var cursor int64
-	writer := bufio.NewWriter(tempFile)
-
-	// recreate index and data file
-	for k, idx := range m.Index {
-		data := make([]byte, idx.End-idx.Start)
-		if _, err := m.dataFile.ReadAt(data, idx.Start); err != nil {
-			tempFile.Close()
-			return err
-		}
-
-		n, err := writer.Write(data)
-		if err != nil {
-			tempFile.Close()
-			return err
-		}
-
-		// update the index directly
-		m.Index[k] = Idx{
-			Start: cursor,
-			End:   cursor + int64(n),
-		}
-		cursor += int64(n)
-	}
-
-	writer.Flush()
-	tempFile.Close()
-	m.dataFile.Close()
-
-	// Replace the original file with the temp updated file
-	if err := os.Rename(tempFilePath, m.Path+"/data.bin"); err != nil {
-		return err
-	}
-
-	// reopen file handles
-	m.dataFile, err = os.OpenFile(m.Path+"/data.bin", os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return err
-	}
-
-	// rewrite index file as well
-	if err := m.rewriteIndex(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (m *Manager) rebuildIndexFile() error {
-	m.idxFile.Truncate(0)
-	m.idxFile.Seek(0, 0)
-
-	writer := bufio.NewWriter(m.idxFile)
-	for key, idx := range m.Index {
-		if _, err := fmt.Fprintf(writer, "%s,%d,%d\n", key, idx.Start, idx.End); err != nil {
-			return err
-		}
+		fmt.Fprintf(writer, "%s,%d,%d\n", k, v.Start, v.End)
 	}
 
 	return writer.Flush()
 }
 
-// GetData reads data from the data file using provided key
 func (m *Manager) GetData(key string) (string, error) {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
 	idx, exists := m.Index[key]
 	if !exists {
-		return "", fmt.Errorf("key %s not found", key)
+		return "", fmt.Errorf("Key %s not found", key)
 	}
 
-	data := make([]byte, idx.End-idx.Start)
-	if _, err := m.dataFile.ReadAt(data, idx.Start); err != nil {
-		return "", err
-	}
+	buf := make([]byte, idx.End-idx.Start)
+	_, err := m.dataFile.ReadAt(buf, idx.Start)
 
-	return string(data), nil
+	return string(buf), err
 }
 
-// Status returns current status
 func (m *Manager) Status() string {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
 	return m.status
 }
 
-// Stop safely shuts down the Manager
 func (m *Manager) Stop() {
-	m.Channel <- "exit"
+	close(m.Channel)
+	close(m.stopCh)
 	m.dataFile.Close()
 	m.idxFile.Close()
 	m.status = "stopped"
