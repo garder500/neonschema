@@ -298,54 +298,70 @@ func (m *Manager) DeleteData(key string) {
 	m.deleteData(key)
 }
 
-func (m *Manager) deleteData(key string) {
-	// we need to get the file where the key was found. And delete from startIndex to endIndex
-	// we will also delete the file
+func (m *Manager) deleteData(key string) error {
 	if val, ok := m.Index[key]; ok {
-		// we will read the data from the file
-		dataFile := m.fileWriter.dataFile
-		dataFile.Seek(0, 0)
-		start := val.start
-		end := val.end
-		// we will read the data from the file
-		data := make([]byte, 1024)
-		_, err := dataFile.ReadAt(data, start)
-		if err != nil {
-			fmt.Println("Error reading data:", err)
-			return
-		}
-		// we need to write 0 bytes to the file from start to end
-		emptyData := make([]byte, end-start)
-		_, err = dataFile.WriteAt(emptyData, start)
-		if err != nil {
-			fmt.Println("Error writing to file:", err)
-			return
-		}
-		// we will delete the index from the index file
-		idxFile, err := os.OpenFile(fmt.Sprintf("%s.idx", m.Path), os.O_WRONLY, 0644)
-		if err != nil {
-			fmt.Println("Error opening file:", err)
-			return
-		}
-		// let's find the index first
-		for {
-			var k, s, e string
-			_, err := fmt.Fscanf(idxFile, "%s,%s,%s\n", &k, &s, &e)
-			if err != nil {
-				break
-			}
-			if k == key {
-				// we will write 0 bytes to the file from start to end
-				_, err = idxFile.WriteAt([]byte(""), start)
-				if err != nil {
-					fmt.Println("Error writing to file:", err)
-					return
-				}
+		// 1. Supprimer l'entrée de l'index en mémoire
+		delete(m.Index, key)
 
-				idxFile.Sync()
-				dataFile.Sync()
-				break
-			}
+		// 2. Marquer l'espace comme libre dans le fichier de données
+		dataFile := m.fileWriter.dataFile
+		emptyData := make([]byte, val.end-val.start)
+		_, err := dataFile.WriteAt(emptyData, val.start)
+		if err != nil {
+			return fmt.Errorf("error writing empty data: %v", err)
+		}
+
+		// 3. Mettre à jour le fichier d'index
+		return m.rewriteIndexFile(key)
+	}
+	return fmt.Errorf("key not found")
+}
+
+func (m *Manager) rewriteIndexFile(key string) error {
+	idxFile := m.fileWriter.idxFile
+
+	// Créer un nouveau fichier d'index temporaire
+	tmpIdxFile, err := os.Create(fmt.Sprintf("%s/tmp.idx", m.Path))
+	if err != nil {
+		return fmt.Errorf("error creating temporary index file: %v", err)
+	}
+	defer tmpIdxFile.Close()
+
+	// Copier les entrées valides de l'index actuel vers le fichier temporaire
+	for k, v := range m.Index {
+		if k == key {
+			continue
+		}
+		_, err := fmt.Fprintf(tmpIdxFile, "%s,%d,%d\n", k, v.start, v.end)
+		if err != nil {
+			return fmt.Errorf("error writing to temporary index file: %v", err)
 		}
 	}
+
+	// Fermer le fichier d'index actuel
+	err = idxFile.Close()
+	if err != nil {
+		return fmt.Errorf("error closing index file: %v", err)
+	}
+
+	// Supprimer l'ancien fichier d'index
+	err = os.Remove(fmt.Sprintf("%s/a.idx", m.Path))
+	if err != nil {
+		return fmt.Errorf("error removing old index file: %v", err)
+	}
+
+	// Renommer le fichier temporaire en fichier d'index actuel
+	err = os.Rename(fmt.Sprintf("%s/tmp.idx", m.Path), fmt.Sprintf("%s/a.idx", m.Path))
+	if err != nil {
+		return fmt.Errorf("error renaming temporary index file: %v", err)
+	}
+
+	// Ouvrir le nouveau fichier d'index
+	idxFile, err = os.OpenFile(fmt.Sprintf("%s/a.idx", m.Path), os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return fmt.Errorf("error opening new index file: %v", err)
+	}
+
+	// Mettre à jour le fichier d'index dans le fileWriter
+	m.fileWriter.idxFile = idxFile
 }
