@@ -12,7 +12,7 @@ import (
 
 var mgr *manager.Manager
 
-var max = 2000000
+var max = 20000
 var waitPeriod time.Duration = 0
 
 func init() {
