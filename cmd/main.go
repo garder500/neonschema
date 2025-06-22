@@ -1,13 +1,30 @@
 package main
 
 import (
-	"fmt"
+	"log"
+	"net/http"
+	"os"
+
+	intenral "neonschem/internal"
+
+	"github.com/joho/godotenv"
 )
 
 func main() {
-	// Example usage of the package
-	fmt.Println("Hello, World!")
-	// You can call functions from your package here
-	// For example: result := mypackage.MyFunction()
-	// fmt.Println(result)
+	// Load environment variables
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("Warning: .env file not found, using system environment variables")
+	}
+
+	// Initialize router
+	r := intenral.Initialize()
+
+	// Start the server
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080" // Default port
+	}
+	log.Printf("Server running on port %s", port)
+	log.Fatal(http.ListenAndServe(":"+port, r))
 }
