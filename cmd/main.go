@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"os"
 
-	intenral "neonschem/internal"
+	internal "neonschem/internal"
 
 	"github.com/joho/godotenv"
 )
@@ -18,7 +18,7 @@ func main() {
 	}
 
 	// Initialize router
-	r := intenral.Initialize()
+	r := internal.Initialize()
 
 	// Start the server
 	port := os.Getenv("PORT")
