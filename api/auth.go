@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+"log"
 	"net/http"
 	"os"
 	"time"
@@ -38,11 +39,12 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 		"exp":      time.Now().Add(time.Hour * 24).Unix(),
 	})
 
-	tokenString, err := token.SignedString(jwtSecret)
-	if err != nil {
-		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
-		return
-	}
+tokenString, err := token.SignedString(jwtSecret)
+if err != nil {
+log.Printf("Error signing token: %v", err)
+http.Error(w, "Failed to generate token", http.StatusInternalServerError)
+return
+}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
@@ -51,23 +53,32 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 // JWTMiddleware validates the JWT token in the request
 func JWTMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tokenString := r.Header.Get("Authorization")
-		if tokenString == "" {
-			http.Error(w, "Missing token", http.StatusUnauthorized)
-			return
-		}
+authHeader := r.Header.Get("Authorization")
+if authHeader == "" || len(authHeader) < 8 || authHeader[:7] != "Bearer " {
+http.Error(w, "Missing or malformed token", http.StatusUnauthorized)
+return
+}
+tokenString := authHeader[7:]
 
-		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, http.ErrAbortHandler
-			}
-			return jwtSecret, nil
-		})
+token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+log.Println("Unexpected signing method")
+return nil, http.ErrAbortHandler
+}
+return jwtSecret, nil
+})
+if _, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+}
 
-		if err != nil || !token.Valid {
-			http.Error(w, "Invalid token", http.StatusUnauthorized)
-			return
-		}
+if err != nil {
+http.Error(w, "Invalid token", http.StatusUnauthorized)
+return
+}
+
+if !token.Valid {
+http.Error(w, "Invalid token", http.StatusUnauthorized)
+return
+}
 
 		next.ServeHTTP(w, r)
 	})
