@@ -1,6 +1,9 @@
 package database
 
 import (
+	"context"
+	"log"
+
 	"golang.org/x/crypto/bcrypt"
 
 	"gorm.io/driver/sqlite"
@@ -75,4 +78,14 @@ func (p *PrivateDB) Close() error {
 // GetDB returns the underlying gorm.DB instance
 func (p *PrivateDB) GetDB() *gorm.DB {
 	return p.DB
+}
+
+type dbContextKey struct{}
+
+func RetrievePrivateDB(ctx context.Context) *gorm.DB {
+	if db, ok := ctx.Value(dbContextKey{}).(*gorm.DB); ok {
+		return db
+	}
+	log.Println("Private database not found in context")
+	return nil
 }
